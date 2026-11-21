@@ -1,0 +1,8 @@
+bin/
+node_modules/
+sdks/*/node_modules/
+sdks/*/dist/
+**/__pycache__/
+*.pyc
+.venv/
+.DS_Store

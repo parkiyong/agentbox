@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-sandbox-zero-trust
+  namespace: {{ .Values.sandboxNamespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: agentbox-runner
+  policyTypes:
+    - Ingress
+    - Egress
+  # Sandboxes accept zero inbound connections and may ONLY talk to the Host-Side Security Proxy.
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: agentbox-runner
+      ports:
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 8082

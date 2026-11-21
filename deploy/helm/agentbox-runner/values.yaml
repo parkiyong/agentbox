@@ -1,0 +1,34 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/agentbox/agentbox-runner
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Sandbox isolation driver: k8s-gvisor | k8s-kata
+driver: k8s-gvisor
+runtimeClassName: gvisor
+sandboxNamespace: agentbox-sandboxes
+
+controlPlane:
+  # Outbound mTLS/gRPC connection — ZERO inbound firewall ports required in customer VPC
+  url: "https://api.agentbox.dev"
+  mtlsSecretName: "agentbox-runner-mtls"
+
+inference:
+  # BYOC may use AgentBox Managed Gateway OR BYOK / self-hosted local vLLM
+  mode: "managed" # managed | byok
+  byokBaseUrl: ""
+  byokSecretName: ""
+
+proxy:
+  apiListen: "0.0.0.0:8081"
+  egressListen: "0.0.0.0:8082"
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi

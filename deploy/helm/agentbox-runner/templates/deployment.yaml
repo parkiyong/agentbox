@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-runner
+  labels:
+    app.kubernetes.io/name: agentbox-runner
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentbox-runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentbox-runner
+    spec:
+      serviceAccountName: {{ .Release.Name }}-runner
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: runner
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--driver={{ .Values.driver }}"
+            - "--control-plane={{ .Values.controlPlane.url }}"
+            - "--proxy-listen={{ .Values.proxy.apiListen }}"
+            - "--egress-listen={{ .Values.proxy.egressListen }}"
+            - "--mtls-cert=/etc/agentbox/mtls/tls.crt"
+            - "--mtls-key=/etc/agentbox/mtls/tls.key"
+            - "--mtls-ca=/etc/agentbox/mtls/ca.crt"
+          env:
+            - name: AGENTBOX_K8S_NAMESPACE
+              value: {{ .Values.sandboxNamespace | quote }}
+            {{- if eq .Values.inference.mode "byok" }}
+            - name: AGENTBOX_LLM_BASE_URL
+              value: {{ .Values.inference.byokBaseUrl | quote }}
+            {{- end }}
+          ports:
+            - name: host-proxy
+              containerPort: 8081
+            - name: egress-fw
+              containerPort: 8082
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: mtls
+              mountPath: /etc/agentbox/mtls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: mtls
+          secret:
+            secretName: {{ .Values.controlPlane.mtlsSecretName }}
+            optional: true
+        - name: tmp
+          emptyDir: {}

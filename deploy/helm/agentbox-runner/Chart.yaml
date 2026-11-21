@@ -1,0 +1,6 @@
+apiVersion: v2
+name: agentbox-runner
+description: Self-Hosted BYOC Data Plane Runner for AgentBox (gVisor/Kata K8s isolation + outbound mTLS + Host-Side Security Proxy)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

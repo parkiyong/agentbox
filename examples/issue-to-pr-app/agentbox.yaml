@@ -1,0 +1,67 @@
+apiVersion: agentbox.dev/v1
+kind: Blueprint
+metadata:
+  name: acme-autofix-swe
+  version: "1.2.0"
+
+runtime:
+  image: ghcr.io/agentbox/swe-node22-py312:v1
+  resources:
+    vcpu: 2
+    memory_mb: 4096
+    disk_gb: 20
+  setup:
+    commands:
+      - "[ -f package-lock.json ] && npm ci || true"
+      - "[ -f pyproject.toml ] && uv sync || true"
+    cache_paths:
+      - node_modules
+      - .venv
+
+model:
+  profile: swe-balanced
+  byoc_provider: null
+
+harness:
+  system_instructions: |
+    You are Acme's automated software engineer. Fix the reported issue with minimal,
+    well-tested changes. Never modify unrelated files or disable existing tests.
+  skills:
+    - path: ./skills/test-conventions.md
+  git:
+    branch_prefix: "agentbox/fix-"
+    auto_create_pr: true
+    protected_branches: ["main", "master", "production"]
+
+network:
+  egress:
+    default: deny
+    allow_domains:
+      - registry.npmjs.org
+      - pypi.org
+      - files.pythonhosted.org
+      - proxy.golang.org
+
+mcp_servers:
+  - name: sentry
+    transport: streamable-http
+    url: https://api.acme.internal/mcp/sentry
+    auth_secret_ref: acme_sentry_mcp_token
+    allowed_tools: ["get_issue", "get_stacktrace"]
+
+policies:
+  approvals:
+    - action: git.push
+      mode: require_approval
+    - action: shell.exec
+      match_regex: "(rm -rf|drop table|migrate|terraform apply)"
+      mode: require_approval
+    - action: fs.edit
+      match_globs: [".github/workflows/**", "**/migrations/**"]
+      mode: require_approval
+
+limits:
+  max_credits: 500
+  max_turns: 40
+  max_wall_clock_seconds: 1800
+  idle_hibernate_seconds: 300
