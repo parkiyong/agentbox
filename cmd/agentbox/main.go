@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -63,8 +64,9 @@ func runDevServer(args []string) {
 	fs := flag.NewFlagSet("dev", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:8080", "Control Plane HTTP listen address")
 	driverName := fs.String("driver", "local", "SandboxDriver: local | docker")
+	agentdBin := fs.String("agentd-bin", "", "Path to static agentd binary (auto-detected if empty)")
 	dataDir := fs.String("data-dir", filepath.Join(os.TempDir(), "agentbox-dev"), "Persistent data directory")
-	mockLLM := fs.Bool("mock-llm", false, "Force deterministic MockSWEProvider (auto-enabled when no API key is set)")
+	mockLLM := fs.Bool("mock-llm", false, "Force deterministic MockSWEProvider")
 	apiKey := fs.String("api-key", "", "Optional org API key (empty = open local dev mode)")
 	_ = fs.Parse(args)
 
@@ -74,14 +76,8 @@ func runDevServer(args []string) {
 	}
 	ledger := controlplane.NewCreditLedger()
 
-	var llmProvider proxy.LLMProvider
-	if *mockLLM || (os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("AGENTBOX_LLM_API_KEY") == "") {
-		log.Printf("LLM provider: MockSWEProvider (set AGENTBOX_LLM_API_KEY or OPENAI_API_KEY for live inference)")
-		llmProvider = proxy.NewMockSWEProvider()
-	} else {
-		log.Printf("LLM provider: OpenAI-compatible (%s)", envOrDefault("AGENTBOX_LLM_BASE_URL", "https://api.openai.com/v1"))
-		llmProvider = proxy.NewOpenAICompatProviderFromEnv()
-	}
+	llmProvider, providerLabel := proxy.NewAutoProviderFromEnv(*mockLLM)
+	log.Printf("LLM provider: %s", providerLabel)
 
 	var gitBroker proxy.GitTokenBroker
 	if tok := os.Getenv("AGENTBOX_GIT_TOKEN"); tok != "" {
@@ -93,6 +89,7 @@ func runDevServer(args []string) {
 		GitBroker:   gitBroker,
 		Secrets:     proxy.NewMapSecretStore(nil),
 	})
+	proxy.RegisterBYOCProvidersFromEnv(hostProxy.LLM)
 	if err := hostProxy.Start("127.0.0.1:0", "127.0.0.1:0"); err != nil {
 		log.Fatalf("start host proxy: %v", err)
 	}
@@ -115,6 +112,7 @@ func runDevServer(args []string) {
 	}
 	auth := controlplane.NewAuthManager(os.Getenv("AGENTBOX_JWT_SECRET"), orgKeys)
 	orch := controlplane.NewOrchestrator(store, ledger, hostProxy, drv)
+	orch.AgentDBinary = sandbox.FindAgentDBinary(*agentdBin)
 	apiSrv := controlplane.NewServer(orch, auth)
 
 	httpSrv := &http.Server{
@@ -126,9 +124,13 @@ func runDevServer(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	execMode := "in-process"
+	if orch.AgentDBinary != "" {
+		execMode = "isolated agentd (" + orch.AgentDBinary + ")"
+	}
 	go func() {
-		log.Printf("AgentBox local dev server listening on http://%s (driver=%s, proxy=%s, egress=%s)",
-			*addr, drv.Name(), hostProxy.APIBaseURL(), hostProxy.EgressProxyURL())
+		log.Printf("AgentBox local dev server listening on http://%s (driver=%s, mode=%s, proxy=%s, egress=%s)",
+			*addr, drv.Name(), execMode, hostProxy.APIBaseURL(), hostProxy.EgressProxyURL())
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)
 		}
@@ -143,7 +145,9 @@ func runDevServer(args []string) {
 func runOneShot(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	blueprintFile := fs.String("blueprint", "", "Path to agentbox.yaml Blueprint")
-	repoPath := fs.String("repo", ".", "Local repository directory to run against")
+	repoFlag := fs.String("repo", ".", "Local repository directory OR remote Git URL (https://...)")
+	baseBranch := fs.String("branch", "", "Optional base branch for remote Git repo")
+	agentdBin := fs.String("agentd-bin", "", "Path to static agentd binary (auto-detected if empty)")
 	task := fs.String("task", "", "Autonomous SWE task prompt")
 	jsonOut := fs.Bool("json", false, "Stream canonical JSON events (one per line)")
 	mockLLM := fs.Bool("mock-llm", false, "Use deterministic MockSWEProvider")
@@ -166,14 +170,17 @@ func runOneShot(args []string) {
 		bp = protocol.DefaultBlueprint("local-cli")
 	}
 
-	var llmProvider proxy.LLMProvider
-	if *mockLLM || (os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("AGENTBOX_LLM_API_KEY") == "") {
-		llmProvider = proxy.NewMockSWEProvider()
-	} else {
-		llmProvider = proxy.NewOpenAICompatProviderFromEnv()
+	llmProvider, _ := proxy.NewAutoProviderFromEnv(*mockLLM)
+	var gitBroker proxy.GitTokenBroker
+	if tok := os.Getenv("AGENTBOX_GIT_TOKEN"); tok != "" {
+		gitBroker = &proxy.StaticGitTokenBroker{Token: tok}
 	}
 
-	hostProxy := proxy.NewHostProxyServer(proxy.Config{LLMProvider: llmProvider})
+	hostProxy := proxy.NewHostProxyServer(proxy.Config{
+		LLMProvider: llmProvider,
+		GitBroker:   gitBroker,
+	})
+	proxy.RegisterBYOCProvidersFromEnv(hostProxy.LLM)
 	if err := hostProxy.Start("127.0.0.1:0", "127.0.0.1:0"); err != nil {
 		log.Fatalf("start host proxy: %v", err)
 	}
@@ -183,9 +190,16 @@ func runOneShot(args []string) {
 	if err != nil {
 		log.Fatalf("init local driver: %v", err)
 	}
-	absRepo, err := filepath.Abs(*repoPath)
-	if err != nil {
-		log.Fatalf("resolve repo path: %v", err)
+
+	var repoSpec protocol.RepoSpec
+	if strings.HasPrefix(*repoFlag, "http://") || strings.HasPrefix(*repoFlag, "https://") {
+		repoSpec = protocol.RepoSpec{URL: *repoFlag, BaseBranch: *baseBranch}
+	} else {
+		absRepo, err := filepath.Abs(*repoFlag)
+		if err != nil {
+			log.Fatalf("resolve repo path: %v", err)
+		}
+		repoSpec = protocol.RepoSpec{LocalPath: absRepo}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -193,7 +207,7 @@ func runOneShot(args []string) {
 
 	sessionID := protocol.NewID("ses_")
 	nonce, _ := protocol.NewNonce()
-	wsID := sandbox.WorkspaceKey("org_local", "local_user", absRepo, bp.Hash())
+	wsID := sandbox.WorkspaceKey("org_local", "local_user", repoSpec.URL+repoSpec.LocalPath, bp.Hash())
 	handle, err := drv.Create(ctx, sandbox.SandboxSpec{
 		SessionID:    sessionID,
 		OrgID:        "org_local",
@@ -202,7 +216,7 @@ func runOneShot(args []string) {
 		SessionNonce: nonce,
 		ProxyAddr:    hostProxy.APIBaseURL(),
 		EgressProxy:  hostProxy.EgressProxyURL(),
-		Repo:         protocol.RepoSpec{LocalPath: absRepo},
+		Repo:         repoSpec,
 	})
 	if err != nil {
 		log.Fatalf("create sandbox: %v", err)
@@ -214,36 +228,85 @@ func runOneShot(args []string) {
 		SessionID:  sessionID,
 		OrgID:      "org_local",
 		CustomerID: "local_user",
+		RepoURL:    repoSpec.URL,
 		Blueprint:  bp,
 	})
+	defer hostProxy.Registry.Unregister(nonce)
 
-	enc := json.NewEncoder(os.Stdout)
-	engine := harness.NewEngine(harness.EngineConfig{
-		SessionID:    sessionID,
-		CustomerID:   "local_user",
-		Workspace:    handle.WorkspacePath,
-		Task:         *task,
-		Blueprint:    bp,
-		Limits:       bp.Limits,
-		ProxyAddr:    hostProxy.APIBaseURL(),
-		SessionNonce: nonce,
-		LLM:          harness.NewProxyLLMClient(hostProxy.APIBaseURL(), nonce),
-		OnEvent: func(evt protocol.Event) {
-			if *jsonOut {
-				_ = enc.Encode(evt)
-				return
-			}
-			fmt.Printf("[%02d] %-20s %s\n", evt.Seq, evt.Type, string(evt.Payload))
-		},
-	})
-
-	summary, err := engine.Run(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "session failed: %v\n", err)
+	if _, err := sandbox.BootstrapWorkspace(ctx, sandbox.BootstrapConfig{
+		WorkspacePath: handle.WorkspacePath,
+		SessionID:     sessionID,
+		Repo:          repoSpec,
+		Blueprint:     bp,
+		ProxyBaseURL:  hostProxy.APIBaseURL(),
+		EgressProxy:   hostProxy.EgressProxyURL(),
+		SessionNonce:  nonce,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "bootstrap workspace failed: %v\n", err)
 		os.Exit(1)
 	}
+
+	enc := json.NewEncoder(os.Stdout)
+	var finalSummary string
+	onEvent := func(evt protocol.Event) {
+		if evt.Type == protocol.EventSessionCompleted {
+			var p protocol.SessionLifecyclePayload
+			if json.Unmarshal(evt.Payload, &p) == nil {
+				finalSummary = p.Summary
+			}
+		}
+		if *jsonOut {
+			_ = enc.Encode(evt)
+			return
+		}
+		fmt.Printf("[%02d] %-20s %s\n", evt.Seq, evt.Type, string(evt.Payload))
+	}
+
+	// Prefer out-of-process static agentd binary with zero-secret environment when available.
+	resolvedBin := sandbox.FindAgentDBinary(*agentdBin)
+	if resolvedBin != "" {
+		proc, err := drv.StartAgent(ctx, handle, sandbox.AgentRunRequest{
+			SessionID:    sessionID,
+			CustomerID:   "local_user",
+			Task:         *task,
+			Blueprint:    bp,
+			Limits:       bp.Limits,
+			SessionNonce: nonce,
+			ProxyAddr:    hostProxy.APIBaseURL(),
+			EgressProxy:  hostProxy.EgressProxyURL(),
+			AgentDBinary: resolvedBin,
+		}, onEvent)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "start agentd failed: %v\n", err)
+			os.Exit(1)
+		}
+		if err := proc.Wait(); err != nil {
+			fmt.Fprintf(os.Stderr, "session failed: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		engine := harness.NewEngine(harness.EngineConfig{
+			SessionID:    sessionID,
+			CustomerID:   "local_user",
+			Workspace:    handle.WorkspacePath,
+			Task:         *task,
+			Blueprint:    bp,
+			Limits:       bp.Limits,
+			ProxyAddr:    hostProxy.APIBaseURL(),
+			SessionNonce: nonce,
+			LLM:          harness.NewProxyLLMClient(hostProxy.APIBaseURL(), nonce),
+			OnEvent:      onEvent,
+		})
+		summary, err := engine.Run(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "session failed: %v\n", err)
+			os.Exit(1)
+		}
+		finalSummary = summary
+	}
+
 	if !*jsonOut {
-		fmt.Printf("\nCompleted (%s): %s\n", sessionID, summary)
+		fmt.Printf("\nCompleted (%s): %s\n", sessionID, finalSummary)
 	}
 }
 
@@ -265,11 +328,4 @@ func runBlueprintCmd(args []string) {
 	fmt.Printf("  MCP:        %d server(s)\n", len(bp.MCPServers))
 	fmt.Printf("  Policies:   %d approval rule(s)\n", len(bp.Policies.Approvals))
 	fmt.Printf("  Limits:     max_credits=%.0f, max_turns=%d, max_wall_clock=%ds\n", bp.Limits.MaxCredits, bp.Limits.MaxTurns, bp.Limits.MaxWallClockSeconds)
-}
-
-func envOrDefault(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

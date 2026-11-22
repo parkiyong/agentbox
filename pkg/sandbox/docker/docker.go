@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -193,6 +194,60 @@ func (d *Driver) Destroy(ctx context.Context, handle *sandbox.SandboxHandle) err
 		_ = os.RemoveAll(handle.WorkspacePath)
 	}
 	return nil
+}
+
+// BuildExecArgs constructs the `docker exec -i` command arguments to run /opt/agentbox/agentd
+// inside the hardened container with zero raw secrets.
+func (d *Driver) BuildExecArgs(containerID string, req sandbox.AgentRunRequest, containerBPPath, limitsJSON string) []string {
+	args := []string{
+		"exec", "-i",
+		"-w", "/workspace",
+		"-e", "AGENTBOX_SESSION_ID=" + req.SessionID,
+		"-e", "AGENTBOX_CUSTOMER_ID=" + req.CustomerID,
+		"-e", "AGENTBOX_WORKSPACE=/workspace",
+		"-e", "AGENTBOX_SESSION_NONCE=" + req.SessionNonce,
+		"-e", "AGENTBOX_TASK=" + req.Task,
+	}
+	if containerBPPath != "" {
+		args = append(args, "-e", "AGENTBOX_BLUEPRINT_PATH="+containerBPPath)
+	}
+	if limitsJSON != "" {
+		args = append(args, "-e", "AGENTBOX_LIMITS_JSON="+limitsJSON)
+	}
+	args = append(args, containerID, "/opt/agentbox/agentd")
+	return args
+}
+
+// StartAgent runs /opt/agentbox/agentd inside the hardened Docker container over `docker exec -i`.
+func (d *Driver) StartAgent(ctx context.Context, handle *sandbox.SandboxHandle, req sandbox.AgentRunRequest, onEvent func(protocol.Event)) (sandbox.AgentProcess, error) {
+	if handle == nil || handle.ContainerID == "" {
+		return nil, fmt.Errorf("docker sandbox handle missing container ID")
+	}
+
+	var containerBPPath string
+	var cleanupFn func()
+	if req.Blueprint != nil {
+		metaDir, err := os.MkdirTemp(d.BaseDir, "docker-bp-*")
+		if err != nil {
+			return nil, err
+		}
+		hostBP, err := sandbox.WriteRuntimeBlueprintFile(metaDir, req.Blueprint)
+		if err != nil {
+			_ = os.RemoveAll(metaDir)
+			return nil, err
+		}
+		containerBPPath = "/tmp/.agentbox-blueprint.json"
+		if _, err := d.runDocker(ctx, "cp", hostBP, handle.ContainerID+":"+containerBPPath); err != nil {
+			_ = os.RemoveAll(metaDir)
+			return nil, fmt.Errorf("copy blueprint into container: %w", err)
+		}
+		cleanupFn = func() { _ = os.RemoveAll(metaDir) }
+	}
+
+	limitsBytes, _ := json.Marshal(req.Limits)
+	execArgs := d.BuildExecArgs(handle.ContainerID, req, containerBPPath, string(limitsBytes))
+	cmd := exec.CommandContext(ctx, d.DockerBinary, execArgs...)
+	return sandbox.StartCmdAgent(cmd, onEvent, cleanupFn)
 }
 
 func (d *Driver) runDocker(ctx context.Context, args ...string) (string, error) {

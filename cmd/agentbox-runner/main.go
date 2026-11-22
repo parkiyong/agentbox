@@ -40,13 +40,8 @@ func main() {
 		log.Fatalf("initialize sandbox driver %q: %v", *driverName, err)
 	}
 
-	var llmProvider proxy.LLMProvider
-	if *mockLLM || (os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("AGENTBOX_LLM_API_KEY") == "") {
-		log.Printf("agentbox-runner: using MockSWEProvider (set AGENTBOX_LLM_API_KEY or OPENAI_API_KEY for live inference)")
-		llmProvider = proxy.NewMockSWEProvider()
-	} else {
-		llmProvider = proxy.NewOpenAICompatProviderFromEnv()
-	}
+	llmProvider, providerLabel := proxy.NewAutoProviderFromEnv(*mockLLM)
+	log.Printf("agentbox-runner: LLM provider=%s", providerLabel)
 
 	var gitBroker proxy.GitTokenBroker
 	if tok := os.Getenv("AGENTBOX_GIT_TOKEN"); tok != "" {
@@ -58,6 +53,7 @@ func main() {
 		GitBroker:   gitBroker,
 		Secrets:     proxy.NewMapSecretStore(nil),
 	})
+	proxy.RegisterBYOCProvidersFromEnv(hostProxy.LLM)
 	if err := hostProxy.Start(*proxyListen, *egressListen); err != nil {
 		log.Fatalf("start host security proxy: %v", err)
 	}

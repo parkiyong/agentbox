@@ -1,5 +1,5 @@
 module github.com/parkiyong/agentbox
 
-go 1.27.4
+go 1.24
 
-require gopkg.in/yaml.v3 v3.0.1 // indirect
+require gopkg.in/yaml.v3 v3.0.1

@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+
+# Stage 1: Build static Go agentd binary (~7.6MB, zero glibc deps)
+FROM golang:1.24-alpine AS agentd-builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/agentd ./cmd/agentd
+COPY pkg ./pkg
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/agentd ./cmd/agentd
+
+# Stage 2: Lean Core SWE Toolchain Image (Node 22 + Python 3.12 + git + ripgrep + uv)
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      curl \
+      git \
+      python3 \
+      python3-pip \
+      python3-venv \
+      ripgrep \
+      unzip \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root sandbox user matching Kubernetes Pod securityContext (runAsUser: 1000)
+RUN useradd -m -u 1000 -s /bin/bash agentbox \
+    && mkdir -p /workspace /opt/agentbox /run/agentbox \
+    && chown -R agentbox:agentbox /workspace /run/agentbox
+
+COPY --from=agentd-builder /out/agentd /opt/agentbox/agentd
+RUN chmod 0555 /opt/agentbox/agentd
+
+USER 1000:1000
+WORKDIR /workspace
+ENTRYPOINT ["/opt/agentbox/agentd"]

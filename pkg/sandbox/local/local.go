@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -125,6 +126,35 @@ func (d *Driver) Destroy(_ context.Context, handle *sandbox.SandboxHandle) error
 		return nil
 	}
 	return os.RemoveAll(handle.WorkspacePath)
+}
+
+// StartAgent executes the static agentd binary out-of-process with a strictly sanitized,
+// zero-secret environment, streaming canonical JSONL events from stdout and receiving
+// interactive control messages on stdin.
+func (d *Driver) StartAgent(ctx context.Context, handle *sandbox.SandboxHandle, req sandbox.AgentRunRequest, onEvent func(protocol.Event)) (sandbox.AgentProcess, error) {
+	binPath := sandbox.FindAgentDBinary(req.AgentDBinary)
+	if binPath == "" {
+		return nil, fmt.Errorf("agentd binary not found")
+	}
+
+	metaDir, err := os.MkdirTemp(d.BaseDir, "agentd-meta-*")
+	if err != nil {
+		return nil, fmt.Errorf("create agentd runtime metadata dir: %w", err)
+	}
+	bpPath, err := sandbox.WriteRuntimeBlueprintFile(metaDir, req.Blueprint)
+	if err != nil {
+		_ = os.RemoveAll(metaDir)
+		return nil, fmt.Errorf("write runtime blueprint: %w", err)
+	}
+	limitsBytes, _ := json.Marshal(req.Limits)
+
+	cmd := exec.CommandContext(ctx, binPath)
+	cmd.Dir = handle.WorkspacePath
+	cmd.Env = sandbox.BuildSandboxEnv(req, handle.WorkspacePath, bpPath, string(limitsBytes))
+
+	return sandbox.StartCmdAgent(cmd, onEvent, func() {
+		_ = os.RemoveAll(metaDir)
+	})
 }
 
 // RunSetupCommands executes Blueprint setup commands inside the isolated workspace.

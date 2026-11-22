@@ -31,6 +31,9 @@ agentbox/
 │   └── python/               # agentbox-python (zero runtime deps)
 ├── deploy/
 │   └── helm/agentbox-runner/ # BYOC Kubernetes Helm chart (gVisor/Kata + zero-inbound NetworkPolicy + outbound mTLS)
+├── docker/
+│   ├── Dockerfile.swe-node22-py312 # Hardened non-root SWE base toolchain image + static /opt/agentbox/agentd
+│   └── Dockerfile.runner           # Minimal BYOC agentbox-runner container image
 └── examples/
     └── issue-to-pr-app/      # End-to-end B2B2C demo embedding AgentBox
 ```
@@ -52,7 +55,7 @@ make test
 ./bin/agentbox blueprint validate examples/issue-to-pr-app/agentbox.yaml
 ```
 
-### 3. Run a Local Autonomous SWE Session
+### 3. Run an Isolated Autonomous SWE Session
 
 ```bash
 ./bin/agentbox run \
@@ -62,7 +65,13 @@ make test
   --mock-llm
 ```
 
-*(Set `AGENTBOX_LLM_API_KEY` or `OPENAI_API_KEY` and omit `--mock-llm` to run against live LLM inference via the Host-Side LLM Proxy.)*
+When `bin/agentd` is built, both `agentbox run` and `agentbox dev` automatically execute `agentd` **out-of-process** with a strictly sanitized zero-secret environment.
+
+For live LLM inference and real remote Git repos (`--repo https://github.com/org/repo.git`), set host-side credentials (held exclusively by the Host Proxy, never passed into the sandbox) and omit `--mock-llm`:
+- `ANTHROPIC_API_KEY` (native Anthropic `/v1/messages` adapter)
+- `GEMINI_API_KEY` (native Gemini `generateContent` adapter)
+- `OPENAI_API_KEY` or `AGENTBOX_LLM_API_KEY` + `AGENTBOX_LLM_BASE_URL` (OpenAI / OpenRouter / local vLLM)
+- `AGENTBOX_GIT_TOKEN` (injected host-side only by `GitBrokerProxy` for clone/fetch/push/PRs)
 
 ### 4. Start the Local Control Plane (`agentbox dev`)
 
